@@ -68,7 +68,7 @@ func (t *defaultsTransformer) Enter(p cty.Path, v cty.Value) (cty.Value, error) 
 	}
 
 	// Look up the defaults for this path.
-	defaults := t.defaults.traverse(p)
+	defaults, _ := t.defaults.traverse(p)
 
 	// If we have no defaults, nothing to do.
 	if len(defaults) == 0 {
@@ -109,55 +109,12 @@ func (t *defaultsTransformer) Enter(p cty.Path, v cty.Value) (cty.Value, error) 
 }
 
 func (t *defaultsTransformer) Exit(p cty.Path, v cty.Value) (cty.Value, error) {
-	v, err := convert.Convert(v, t.defaults.traverseType(p))
+	_, targetType := t.defaults.traverse(p)
+	v, err := convert.Convert(v, targetType)
 	if err != nil {
-		return cty.DynamicVal, err
+		return cty.NilVal, err
 	}
 	return v, nil
-}
-
-func (d *Defaults) traverseType(path cty.Path) cty.Type {
-	if len(path) == 0 {
-		return d.Type
-	}
-
-	switch s := path[0].(type) {
-	case cty.GetAttrStep:
-		if d.Type.IsObjectType() {
-			// Attribute path steps are normally applied to objects, where each
-			// attribute may have different defaults.
-			return d.traverseChildType(s.Name, path)
-		} else if d.Type.IsMapType() {
-			// Literal values for maps can result in attribute path steps, in which
-			// case we need to disregard the attribute name, as maps can have only
-			// one child.
-			return d.traverseChildType("", path)
-		}
-
-		return cty.DynamicPseudoType
-	case cty.IndexStep:
-		if d.Type.IsTupleType() {
-			// Tuples can have different types for each element, so we look
-			// up the defaults based on the index key.
-			return d.traverseChildType(s.Key.AsBigFloat().String(), path)
-		} else if d.Type.IsCollectionType() {
-			// Defaults for collection element types are stored with a blank
-			// key, so we disregard the index key.
-			return d.traverseChildType("", path)
-		}
-		return cty.DynamicPseudoType
-	default:
-		// At time of writing there are no other path step types.
-		return cty.DynamicPseudoType
-	}
-
-}
-
-func (d *Defaults) traverseChildType(name string, path cty.Path) cty.Type {
-	if child, ok := d.Children[name]; ok {
-		return child.traverseType(path[1:])
-	}
-	return cty.DynamicPseudoType
 }
 
 // traverse walks the abstract defaults structure for a given path, returning
@@ -165,9 +122,9 @@ func (d *Defaults) traverseChildType(name string, path cty.Path) cty.Type {
 // differs from applying a path to a value because we need to customize the
 // traversal steps for collection types, where a single set of defaults can be
 // applied to an arbitrary number of elements.
-func (d *Defaults) traverse(path cty.Path) map[string]cty.Value {
+func (d *Defaults) traverse(path cty.Path) (map[string]cty.Value, cty.Type) {
 	if len(path) == 0 {
-		return d.DefaultValues
+		return d.DefaultValues, d.Type
 	}
 
 	switch s := path[0].(type) {
@@ -183,7 +140,7 @@ func (d *Defaults) traverse(path cty.Path) map[string]cty.Value {
 			return d.traverseChild("", path)
 		}
 
-		return nil
+		return nil, cty.NilType
 	case cty.IndexStep:
 		if d.Type.IsTupleType() {
 			// Tuples can have different types for each element, so we look
@@ -194,18 +151,18 @@ func (d *Defaults) traverse(path cty.Path) map[string]cty.Value {
 			// key, so we disregard the index key.
 			return d.traverseChild("", path)
 		}
-		return nil
+		return nil, cty.NilType
 	default:
 		// At time of writing there are no other path step types.
-		return nil
+		return nil, cty.NilType
 	}
 }
 
 // traverseChild continues the traversal for a given child key, and mutually
 // recurses with traverse.
-func (d *Defaults) traverseChild(name string, path cty.Path) map[string]cty.Value {
+func (d *Defaults) traverseChild(name string, path cty.Path) (map[string]cty.Value, cty.Type) {
 	if child, ok := d.Children[name]; ok {
 		return child.traverse(path[1:])
 	}
-	return nil
+	return nil, cty.DynamicPseudoType
 }

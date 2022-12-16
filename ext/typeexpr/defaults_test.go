@@ -320,7 +320,8 @@ func TestDefaults_Apply(t *testing.T) {
 				}),
 				cty.ObjectVal(map[string]cty.Value{
 					// No default value for "c" specified, so none applied. The
-					// convert stage will have filled in a null.
+					// apply process converts to the target type, filling in a
+					// null.
 					"c": cty.NullVal(cty.Object(map[string]cty.Type{
 						"a": cty.String,
 						"b": cty.Bool,
@@ -442,7 +443,7 @@ func TestDefaults_Apply(t *testing.T) {
 				}),
 			}),
 		},
-		"my_test_case": {
+		"nested set of objects with optional attributes, with maps as inputs": {
 			defaults: &Defaults{
 				Type: cty.Set(cty.Object(map[string]cty.Type{
 					"name": cty.String,
@@ -748,7 +749,65 @@ func TestDefaults_Apply(t *testing.T) {
 				},
 			},
 			value: cty.EmptyObjectVal,
-			want:  cty.EmptyObjectVal,
+			// The apply process will also apply a conversion and convert the
+			// missing optionals to null, so no defaults applied by a null value
+			// is populated.
+			want: cty.ObjectVal(map[string]cty.Value{
+				"settings": cty.NullVal(cty.Object(map[string]cty.Type{
+					"setting_one": cty.String,
+					"setting_two": cty.Number,
+				})),
+			}),
+		},
+		"should convert from dynamic types into concrete types when needed": {
+			defaults: &Defaults{
+				Type: cty.List(cty.ObjectWithOptionalAttrs(map[string]cty.Type{
+					"name":   cty.String,
+					"taints": cty.List(cty.Map(cty.DynamicPseudoType)),
+				}, []string{"name", "taints"})),
+				DefaultValues: nil,
+				Children: map[string]*Defaults{
+					"": {
+						Type: cty.ObjectWithOptionalAttrs(map[string]cty.Type{
+							"name":   cty.String,
+							"taints": cty.List(cty.Map(cty.DynamicPseudoType)),
+						}, []string{"name", "taints"}),
+						DefaultValues: map[string]cty.Value{
+							"name":   cty.StringVal("default"),
+							"taints": cty.ListValEmpty(cty.Map(cty.DynamicPseudoType)),
+						},
+					},
+				},
+			},
+			value: cty.TupleVal([]cty.Value{
+				cty.ObjectVal(map[string]cty.Value{
+					"name": cty.StringVal("default"),
+				}),
+				cty.ObjectVal(map[string]cty.Value{
+					"name": cty.StringVal("complex"),
+					"taints": cty.ListVal([]cty.Value{
+						cty.MapVal(map[string]cty.Value{
+							"key":   cty.StringVal("my_key"),
+							"value": cty.StringVal("my_value"),
+						}),
+					}),
+				}),
+			}),
+			want: cty.ListVal([]cty.Value{
+				cty.ObjectVal(map[string]cty.Value{
+					"name":   cty.StringVal("default"),
+					"taints": cty.ListValEmpty(cty.Map(cty.String)),
+				}),
+				cty.ObjectVal(map[string]cty.Value{
+					"name": cty.StringVal("complex"),
+					"taints": cty.ListVal([]cty.Value{
+						cty.MapVal(map[string]cty.Value{
+							"key":   cty.StringVal("my_key"),
+							"value": cty.StringVal("my_value"),
+						}),
+					}),
+				}),
+			}),
 		},
 	}
 
