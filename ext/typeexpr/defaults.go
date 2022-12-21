@@ -1,6 +1,7 @@
 package typeexpr
 
 import (
+	"errors"
 	"sort"
 	"strconv"
 
@@ -39,51 +40,78 @@ type Defaults struct {
 // caller will have better context to report useful type conversion failure
 // diagnostics.
 func (d *Defaults) Apply(val cty.Value) cty.Value {
-	return d.apply(val)
+	val, err := d.apply(val, false)
+	if err != nil {
+		panic(err)
+	}
+	return val
 }
 
-func (d *Defaults) apply(v cty.Value) cty.Value {
+func (d *Defaults) ApplyAndConvert(val cty.Value) (cty.Value, error) {
+	return d.apply(val, true)
+}
+
+func (d *Defaults) apply(val cty.Value, cnv bool) (cty.Value, error) {
 	// We don't apply defaults to null values or unknown values. To be clear,
 	// we will overwrite children values with defaults if they are null but not
 	// if the actual value is null.
-	if !v.IsKnown() || v.IsNull() {
-		return v
+	if !val.IsKnown() || val.IsNull() {
+		return val, nil
 	}
 
 	// Also, do nothing if we have no defaults to apply.
 	if len(d.DefaultValues) == 0 && len(d.Children) == 0 {
-		return v
+		return val, nil
 	}
 
-	v, marks := v.Unmark()
+	v, marks := val.Unmark()
 
 	switch {
 	case v.Type().IsSetType(), v.Type().IsListType(), v.Type().IsTupleType():
-		values := d.applyAsSlice(v)
+		values, err := d.applyAsSlice(v, cnv)
+		if err != nil {
+			return cty.NilVal, err
+		}
+
+		makeTuple := true
 		switch {
 		case v.Type().IsSetType():
 			if len(values) == 0 {
-				return cty.SetValEmpty(v.Type().ElementType()).WithMarks(marks)
+				makeTuple = false
+				v = cty.SetValEmpty(v.Type().ElementType())
+				break
 			}
 			if converts := d.unifyAsSlice(values); len(converts) > 0 {
-				return cty.SetVal(converts).WithMarks(marks)
+				makeTuple = false
+				v = cty.SetVal(converts).WithMarks(marks)
 			}
 		case v.Type().IsListType():
 			if len(values) == 0 {
-				return cty.ListValEmpty(v.Type().ElementType()).WithMarks(marks)
+				makeTuple = false
+				v = cty.ListValEmpty(v.Type().ElementType()).WithMarks(marks)
+				break
 			}
 			if converts := d.unifyAsSlice(values); len(converts) > 0 {
-				return cty.ListVal(converts).WithMarks(marks)
+				makeTuple = false
+				v = cty.ListVal(converts).WithMarks(marks)
 			}
 		}
-		return cty.TupleVal(values).WithMarks(marks)
+		if makeTuple {
+			v = cty.TupleVal(values).WithMarks(marks)
+		}
 	case v.Type().IsObjectType(), v.Type().IsMapType():
-		values := d.applyAsMap(v)
+		values, err := d.applyAsMap(v, cnv)
+		if err != nil {
+			return cty.NilVal, err
+		}
 
 		for key, defaultValue := range d.DefaultValues {
 			if value, ok := values[key]; !ok || value.IsNull() {
 				if defaults, ok := d.Children[key]; ok {
-					values[key] = defaults.apply(defaultValue)
+					var err error
+					if values[key], err = defaults.apply(defaultValue, cnv); err != nil {
+						return cty.NilVal, err
+					}
 					continue
 				}
 				values[key] = defaultValue
@@ -92,41 +120,55 @@ func (d *Defaults) apply(v cty.Value) cty.Value {
 
 		if v.Type().IsMapType() {
 			if len(values) == 0 {
-				return cty.MapValEmpty(v.Type().ElementType()).WithMarks(marks)
+				v = cty.MapValEmpty(v.Type().ElementType())
+				break
 			}
 			if converts := d.unifyAsMap(values); len(converts) > 0 {
-				return cty.MapVal(converts).WithMarks(marks)
+				v = cty.MapVal(converts)
+				break
 			}
 		}
-		return cty.ObjectVal(values).WithMarks(marks)
-	default:
-		return v.WithMarks(marks)
+		v = cty.ObjectVal(values)
 	}
+
+	if cnv {
+		var err error
+		if v, err = convert.Convert(v, d.Type); err != nil {
+			return cty.NilVal, errors.New(convert.MismatchMessage(val.Type(), v.Type()))
+		}
+	}
+	return v.WithMarks(marks), nil
 }
 
-func (d *Defaults) applyAsSlice(value cty.Value) []cty.Value {
+func (d *Defaults) applyAsSlice(value cty.Value, cnv bool) ([]cty.Value, error) {
 	var elements []cty.Value
 	for ix, element := range value.AsValueSlice() {
 		if childDefaults := d.getChild(ix); childDefaults != nil {
-			element = childDefaults.apply(element)
+			element, err := childDefaults.apply(element, cnv)
+			if err != nil {
+				return nil, err
+			}
 			elements = append(elements, element)
 			continue
 		}
 		elements = append(elements, element)
 	}
-	return elements
+	return elements, nil
 }
 
-func (d *Defaults) applyAsMap(value cty.Value) map[string]cty.Value {
+func (d *Defaults) applyAsMap(value cty.Value, cnv bool) (map[string]cty.Value, error) {
 	elements := make(map[string]cty.Value)
 	for key, element := range value.AsValueMap() {
 		if childDefaults := d.getChild(key); childDefaults != nil {
-			elements[key] = childDefaults.apply(element)
+			var err error
+			if elements[key], err = childDefaults.apply(element, cnv); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		elements[key] = element
 	}
-	return elements
+	return elements, nil
 }
 
 func (d *Defaults) getChild(key interface{}) *Defaults {
