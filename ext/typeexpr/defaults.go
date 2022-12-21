@@ -1,6 +1,7 @@
 package typeexpr
 
 import (
+	"errors"
 	"sort"
 	"strconv"
 
@@ -39,94 +40,110 @@ type Defaults struct {
 // caller will have better context to report useful type conversion failure
 // diagnostics.
 func (d *Defaults) Apply(val cty.Value) cty.Value {
-	return d.apply(val)
+	applied, err := d.apply(val, false)
+	if err != nil {
+		// This shouldn't really happen, as the conversion is safe when the
+		// concrete variable is false.
+		panic(err)
+	}
+	return applied
 }
 
-func (d *Defaults) apply(v cty.Value) cty.Value {
+func (d *Defaults) ApplyAndConvert(val cty.Value) (cty.Value, error) {
+	return d.apply(val, true)
+}
+
+func (d *Defaults) apply(v cty.Value, concrete bool) (cty.Value, error) {
 	// We don't apply defaults to null values or unknown values. To be clear,
 	// we will overwrite children values with defaults if they are null but not
 	// if the actual value is null.
 	if !v.IsKnown() || v.IsNull() {
-		return v
+		return v, nil
 	}
 
 	// Also, do nothing if we have no defaults to apply.
 	if len(d.DefaultValues) == 0 && len(d.Children) == 0 {
-		return v
+		return v, nil
 	}
 
 	v, marks := v.Unmark()
 
 	switch {
 	case v.Type().IsSetType(), v.Type().IsListType(), v.Type().IsTupleType():
-		values := d.applyAsSlice(v)
-		switch {
-		case v.Type().IsSetType():
-			if len(values) == 0 {
-				return cty.SetValEmpty(v.Type().ElementType()).WithMarks(marks)
-			}
-			if converts := d.unifyAsSlice(values); len(converts) > 0 {
-				return cty.SetVal(converts).WithMarks(marks)
-			}
-		case v.Type().IsListType():
-			if len(values) == 0 {
-				return cty.ListValEmpty(v.Type().ElementType()).WithMarks(marks)
-			}
-			if converts := d.unifyAsSlice(values); len(converts) > 0 {
-				return cty.ListVal(converts).WithMarks(marks)
-			}
+		values, err := d.applyAsSlice(v, concrete)
+		if err != nil {
+			return cty.NilVal, err
 		}
-		return cty.TupleVal(values).WithMarks(marks)
+
+		if concrete {
+			v, err = convert.Convert(cty.TupleVal(values), d.Type)
+			if err != nil {
+				return v, errors.New(convert.MismatchMessage(v.Type(), d.Type))
+			}
+		} else {
+			v = d.unifyFromSlice(v.Type(), values)
+		}
 	case v.Type().IsObjectType(), v.Type().IsMapType():
-		values := d.applyAsMap(v)
+		values, err := d.applyAsMap(v, concrete)
+		if err != nil {
+			return cty.NilVal, err
+		}
 
 		for key, defaultValue := range d.DefaultValues {
 			if value, ok := values[key]; !ok || value.IsNull() {
 				if defaults, ok := d.Children[key]; ok {
-					values[key] = defaults.apply(defaultValue)
+					var err error
+					if values[key], err = defaults.apply(defaultValue, concrete); err != nil {
+						return cty.NilVal, err
+					}
 					continue
 				}
 				values[key] = defaultValue
 			}
 		}
 
-		if v.Type().IsMapType() {
-			if len(values) == 0 {
-				return cty.MapValEmpty(v.Type().ElementType()).WithMarks(marks)
+		if concrete {
+			v, err = convert.Convert(cty.ObjectVal(values), d.Type)
+			if err != nil {
+				return v, errors.New(convert.MismatchMessage(v.Type(), d.Type))
 			}
-			if converts := d.unifyAsMap(values); len(converts) > 0 {
-				return cty.MapVal(converts).WithMarks(marks)
-			}
+		} else {
+			v = d.unifyFromMap(v.Type(), values)
 		}
-		return cty.ObjectVal(values).WithMarks(marks)
-	default:
-		return v.WithMarks(marks)
 	}
+
+	return v.WithMarks(marks), nil
 }
 
-func (d *Defaults) applyAsSlice(value cty.Value) []cty.Value {
+func (d *Defaults) applyAsSlice(value cty.Value, concrete bool) ([]cty.Value, error) {
 	var elements []cty.Value
 	for ix, element := range value.AsValueSlice() {
 		if childDefaults := d.getChild(ix); childDefaults != nil {
-			element = childDefaults.apply(element)
+			element, err := childDefaults.apply(element, concrete)
+			if err != nil {
+				return nil, err
+			}
 			elements = append(elements, element)
 			continue
 		}
 		elements = append(elements, element)
 	}
-	return elements
+	return elements, nil
 }
 
-func (d *Defaults) applyAsMap(value cty.Value) map[string]cty.Value {
+func (d *Defaults) applyAsMap(value cty.Value, concrete bool) (map[string]cty.Value, error) {
 	elements := make(map[string]cty.Value)
 	for key, element := range value.AsValueMap() {
 		if childDefaults := d.getChild(key); childDefaults != nil {
-			elements[key] = childDefaults.apply(element)
+			var err error
+			if elements[key], err = childDefaults.apply(element, concrete); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		elements[key] = element
 	}
-	return elements
+	return elements, nil
 }
 
 func (d *Defaults) getChild(key interface{}) *Defaults {
@@ -142,14 +159,18 @@ func (d *Defaults) getChild(key interface{}) *Defaults {
 	}
 }
 
-func (d *Defaults) unifyAsSlice(values []cty.Value) []cty.Value {
+func (d *Defaults) unifyFromSlice(target cty.Type, values []cty.Value) cty.Value {
+	if target.IsTupleType() {
+		return cty.TupleVal(values)
+	}
+
 	var types []cty.Type
 	for _, value := range values {
 		types = append(types, value.Type())
 	}
 	unify, conversions := convert.UnifyUnsafe(types)
 	if unify == cty.NilType {
-		return nil
+		return cty.TupleVal(values)
 	}
 
 	var converts []cty.Value
@@ -161,14 +182,23 @@ func (d *Defaults) unifyAsSlice(values []cty.Value) []cty.Value {
 
 		converted, err := conversions[ix](values[ix])
 		if err != nil {
-			return nil
+			return cty.TupleVal(values)
 		}
 		converts = append(converts, converted)
 	}
-	return converts
+
+	if target.IsSetType() {
+		return cty.SetVal(converts)
+	} else {
+		return cty.ListVal(converts)
+	}
 }
 
-func (d *Defaults) unifyAsMap(values map[string]cty.Value) map[string]cty.Value {
+func (d *Defaults) unifyFromMap(target cty.Type, values map[string]cty.Value) cty.Value {
+	if target.IsObjectType() {
+		return cty.ObjectVal(values)
+	}
+
 	var keys []string
 	for key := range values {
 		keys = append(keys, key)
@@ -181,7 +211,7 @@ func (d *Defaults) unifyAsMap(values map[string]cty.Value) map[string]cty.Value 
 	}
 	unify, conversions := convert.UnifyUnsafe(types)
 	if unify == cty.NilType {
-		return nil
+		return cty.ObjectVal(values)
 	}
 
 	converts := make(map[string]cty.Value)
@@ -193,8 +223,8 @@ func (d *Defaults) unifyAsMap(values map[string]cty.Value) map[string]cty.Value 
 
 		var err error
 		if converts[key], err = conversions[ix](values[key]); err != nil {
-			return nil
+			return cty.ObjectVal(values)
 		}
 	}
-	return converts
+	return cty.MapVal(converts)
 }

@@ -25,6 +25,7 @@ func TestDefaults_Apply(t *testing.T) {
 		defaults *Defaults
 		value    cty.Value
 		want     cty.Value
+		convert  bool
 	}{
 		// Nothing happens when there are no default values and no children.
 		"no defaults": {
@@ -56,6 +57,22 @@ func TestDefaults_Apply(t *testing.T) {
 			want: cty.MapVal(map[string]cty.Value{
 				"a": cty.StringVal("foo"),
 				"b": cty.StringVal("true"),
+			}),
+		},
+		"simple object with defaults applied convert": {
+			defaults: &Defaults{
+				Type: simpleObject,
+				DefaultValues: map[string]cty.Value{
+					"b": cty.True,
+				},
+			},
+			convert: true,
+			value: cty.MapVal(map[string]cty.Value{
+				"a": cty.StringVal("foo"),
+			}),
+			want: cty.ObjectVal(map[string]cty.Value{
+				"a": cty.StringVal("foo"),
+				"b": cty.True,
 			}),
 		},
 		// Unknown values may be assigned to root modules during validation,
@@ -698,6 +715,56 @@ func TestDefaults_Apply(t *testing.T) {
 				}),
 			}),
 		},
+		"tuples lose custom values and dynamic types on convert": {
+			defaults: &Defaults{
+				Type: cty.List(cty.ObjectWithOptionalAttrs(map[string]cty.Type{
+					"name":   cty.String,
+					"taints": cty.List(cty.Map(cty.DynamicPseudoType)),
+				}, []string{"name", "taints"})),
+				Children: map[string]*Defaults{
+					"": {
+						Type: cty.ObjectWithOptionalAttrs(map[string]cty.Type{
+							"name":   cty.String,
+							"taints": cty.List(cty.Map(cty.DynamicPseudoType)),
+						}, []string{"name", "taints"}),
+						DefaultValues: map[string]cty.Value{
+							"name":   cty.StringVal("default"),
+							"taints": cty.ListValEmpty(cty.Map(cty.DynamicPseudoType)),
+						},
+					},
+				},
+			},
+			convert: true,
+			value: cty.TupleVal([]cty.Value{
+				cty.ObjectVal(map[string]cty.Value{
+					"name": cty.StringVal("node-pool-32"),
+				}),
+				cty.ObjectVal(map[string]cty.Value{
+					"name": cty.StringVal("node-envoy-32"),
+					"taints": cty.ListVal([]cty.Value{
+						cty.MapVal(map[string]cty.Value{
+							"key":   cty.StringVal("etsy.com/nodepool"),
+							"value": cty.StringVal("envoy"),
+						}),
+					}),
+				}),
+			}),
+			want: cty.ListVal([]cty.Value{
+				cty.ObjectVal(map[string]cty.Value{
+					"name":   cty.StringVal("node-pool-32"),
+					"taints": cty.ListValEmpty(cty.Map(cty.String)),
+				}),
+				cty.ObjectVal(map[string]cty.Value{
+					"name": cty.StringVal("node-envoy-32"),
+					"taints": cty.ListVal([]cty.Value{
+						cty.MapVal(map[string]cty.Value{
+							"key":   cty.StringVal("etsy.com/nodepool"),
+							"value": cty.StringVal("envoy"),
+						}),
+					}),
+				}),
+			}),
+		},
 		"lists merge dynamic types with concrete types": {
 			defaults: &Defaults{
 				Type: cty.List(cty.ObjectWithOptionalAttrs(map[string]cty.Type{
@@ -752,7 +819,17 @@ func TestDefaults_Apply(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			got := tc.defaults.Apply(tc.value)
+			var got cty.Value
+			if tc.convert {
+				var err error
+				got, err = tc.defaults.ApplyAndConvert(tc.value)
+				if err != nil {
+					t.Fatalf("unexpected error: " + err.Error())
+				}
+			} else {
+				got = tc.defaults.Apply(tc.value)
+			}
+
 			if !cmp.Equal(tc.want, got, valueComparer) {
 				t.Errorf("wrong result\n%s", cmp.Diff(tc.want, got, valueComparer))
 			}
